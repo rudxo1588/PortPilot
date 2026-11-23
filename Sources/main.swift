@@ -89,8 +89,8 @@ private final class ProcessRankingPanel: NSBox {
         for (index, row) in rows.enumerated() {
             let process = processes.indices.contains(index) ? processes[index] : nil
             row.rank.stringValue = process == nil ? "" : "\(index + 1)"
-            row.name.stringValue = process.map { $0.name } ?? (index == 0 ? emptyMessage : "")
-            row.name.toolTip = process?.name
+            row.name.stringValue = process.map { $0.location?.displayName(for: $0.name) ?? $0.name } ?? (index == 0 ? emptyMessage : "")
+            row.name.toolTip = process?.location?.detail ?? process?.name
             row.pid.stringValue = process.map { "PID \($0.pid)" } ?? ""
             row.value.stringValue = process.map(format) ?? ""
         }
@@ -221,7 +221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         rankings.distribution = .fillEqually
         rankings.alignment = .height
         rankings.spacing = 12
-        search.placeholderString = "포트, PID, 프로세스명, 소유자, Java 앱 검색"
+        search.placeholderString = "포트, PID, 프로세스, 프로젝트명·경로 검색"
         search.delegate = self
         search.setAccessibilityLabel("포트 및 프로세스 검색")
         search.sendsSearchStringImmediately = true
@@ -257,7 +257,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         table.action = #selector(toggleClickedRow(_:))
         table.setAccessibilityLabel("TCP LISTEN 포트 목록")
         let columns: [(String, String, CGFloat)] = [
-            ("check", "선택", 43), ("port", "포트", 55), ("process", "프로세스", 120), ("pid", "PID", 60),
+            ("check", "선택", 43), ("port", "포트", 55), ("process", "프로세스 / 프로젝트", 192), ("pid", "PID", 60),
             ("cpu", "CPU", 66), ("memory", "메모리", 82), ("uptime", "실행 시간", 100),
             ("owner", "소유자", 80), ("java", "Java 앱 / 용도", 150), ("address", "주소", 110),
             ("safety", "종료 가능 여부", 160)
@@ -371,7 +371,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         label.font = .systemFont(ofSize: 12)
         switch column.identifier.rawValue {
         case "port": label.stringValue = String(listener.port); label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-        case "process": label.stringValue = listener.processName
+        case "process":
+            let location = processLocation(for: listener)
+            label.stringValue = location?.displayName(for: listener.processName) ?? listener.processName
+            label.toolTip = location?.detail
         case "pid": label.stringValue = String(listener.pid); label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         case "uptime", "memory", "cpu":
             label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
@@ -394,7 +397,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         default: break
         }
         if listener.blockedReason != nil && column.identifier.rawValue != "safety" { label.textColor = .secondaryLabelColor }
-        label.toolTip = label.stringValue
+        if label.toolTip == nil { label.toolTip = label.stringValue }
         label.translatesAutoresizingMaskIntoConstraints = false
         cell.addSubview(label)
         cell.textField = label
@@ -471,17 +474,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }.map(\.port)
     }
 
+    private func processLocation(for listener: Listener) -> ProcessLocation? {
+        guard let ports = portSnapshot else { return nil }
+        return resourceSnapshot?.usage(for: listener, in: ports)?.location
+    }
+
     private func updatePortTable(clearSelection: Bool, refreshingMetrics: Bool = false) {
         if clearSelection { checked.removeAll() }
         let query = search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let filtered = allListeners.filter { row in
             let matchFilter = filter.selectedSegment == 0 || (filter.selectedSegment == 1 ? row.isJava : row.isDevelopment)
-            let haystack = "\(row.port) \(row.pid) \(row.processName) \(row.owner) \(row.address) \(row.javaApp ?? "")".lowercased()
-            return matchFilter && (query.isEmpty || haystack.contains(query))
+            guard matchFilter, !query.isEmpty else { return matchFilter }
+            let location = processLocation(for: row)
+            let haystack = "\(row.port) \(row.pid) \(row.processName) \(row.owner) \(row.address) \(row.javaApp ?? "") \(location?.projectName ?? "") \(location?.directory ?? "")".lowercased()
+            return haystack.contains(query)
         }
         let sorted = sortPorts(filtered)
         if refreshingMetrics && visible == sorted {
-            let identifiers = PortSortColumn.metrics.map(\.rawValue)
+            let identifiers = PortSortColumn.metrics.map(\.rawValue) + ["process"]
             let columns = IndexSet(identifiers.map {
                 table.column(withIdentifier: NSUserInterfaceItemIdentifier($0))
             }.filter { $0 >= 0 })
@@ -516,9 +526,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func refreshResources() {
         guard !samplingResources else { return }
         samplingResources = true
+        let listenerPIDs = Set(allListeners.map(\.pid))
         resourceWorker.async {
             let capacity = self.capacitySampler.sample()
-            let outcome = Result { try PortService.resourceSnapshot() }
+            let outcome = Result { try PortService.resourceSnapshot(listenerPIDs: listenerPIDs) }
             DispatchQueue.main.async {
                 self.samplingResources = false
                 self.showCapacity(capacity)

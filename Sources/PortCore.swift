@@ -46,12 +46,74 @@ struct Snapshot {
     var warning: String?
 }
 
+struct ProcessLocation {
+    let directory: String
+    let projectName: String?
+
+    var detail: String {
+        projectName == nil ? "작업 폴더\n\(directory)" : "프로젝트 경로\n\(directory)"
+    }
+
+    func displayName(for process: String) -> String {
+        if let projectName { return "\(process) · \(projectName)" }
+        // Standalone Node scripts may have no package manifest. Show their working folder.
+        if ["node", "nodejs", "bun", "deno"].contains(process.lowercased()),
+           directory != "/", directory != FileManager.default.homeDirectoryForCurrentUser.path {
+            return "\(process) · \((directory as NSString).lastPathComponent)"
+        }
+        return process
+    }
+
+    static func lookup(workingDirectory: String) -> ProcessLocation {
+        let cwd = URL(fileURLWithPath: workingDirectory, isDirectory: true).standardizedFileURL
+        let fallback = ProcessLocation(directory: cwd.path, projectName: nil)
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL
+        let components = cwd.pathComponents
+        guard !components.contains(where: { $0.hasSuffix(".app") }) else { return fallback }
+
+        var candidate = cwd
+        if let index = components.firstIndex(where: { ["node_modules", ".venv", ".git"].contains($0) }) {
+            candidate = URL(fileURLWithPath: NSString.path(withComponents: Array(components.prefix(index))), isDirectory: true)
+        }
+        let markers = [".git", "pyproject.toml", "Cargo.toml", "go.mod", "pom.xml", "settings.gradle",
+                       "settings.gradle.kts", "build.gradle", "build.gradle.kts", "Package.swift"]
+        while candidate.path != "/" && candidate.path != home.path {
+            let manifest = candidate.appendingPathComponent("package.json")
+            if FileManager.default.fileExists(atPath: manifest.path) {
+                return ProcessLocation(directory: candidate.path, projectName: packageName(manifest) ?? candidate.lastPathComponent)
+            }
+            if markers.contains(where: { FileManager.default.fileExists(atPath: candidate.appendingPathComponent($0).path) }) {
+                return ProcessLocation(directory: candidate.path, projectName: candidate.lastPathComponent)
+            }
+            candidate.deleteLastPathComponent()
+        }
+        return fallback
+    }
+
+    private static func packageName(_ url: URL) -> String? {
+        let fd = open(url.path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)
+        guard fd >= 0 else { return nil }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? handle.close() }
+        let limit = 1024 * 1024
+        var metadata = stat()
+        guard fstat(fd, &metadata) == 0, (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_size > 0, metadata.st_size <= limit,
+              let data = try? handle.read(upToCount: limit + 1), data.count <= limit,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let name = (object["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty else { return nil }
+        return PortService.displaySafe(name)
+    }
+}
+
 struct ProcessUsage {
     let pid: Int32
     let name: String
     let cpuPercent: Double
     let residentBytes: Int64
     let startedAt: Date?
+    var location: ProcessLocation? = nil
 
     var cpuText: String { String(format: "%.1f%%", cpuPercent) }
     var memoryText: String { ByteCountFormatter.string(fromByteCount: residentBytes, countStyle: .memory) }
@@ -184,7 +246,7 @@ final class PortService {
         return snapshot
     }
 
-    static func resourceSnapshot() throws -> ResourceSnapshot {
+    static func resourceSnapshot(listenerPIDs: Set<Int32> = []) throws -> ResourceSnapshot {
         // A private temporary file lets ps finish even if its output exceeds a pipe buffer.
         guard let output = tmpfile() else { throw PortError.message("프로세스 사용량을 수집할 수 없습니다.") }
         defer { fclose(output) }
@@ -237,8 +299,21 @@ final class PortService {
         let byMemory = rows.sorted {
             $0.residentBytes == $1.residentBytes ? $0.pid < $1.pid : $0.residentBytes > $1.residentBytes
         }
-        return ResourceSnapshot(byCPU: Array(byCPU.prefix(3)), byMemory: Array(byMemory.prefix(3)),
-                                byPID: Dictionary(rows.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first }), sampledAt: sampledAt)
+        let cpuLeaders = byCPU.prefix(3).map(\.pid)
+        let memoryLeaders = byMemory.prefix(3).map(\.pid)
+        var byPID = Dictionary(rows.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+        var locations: [String: ProcessLocation] = [:]
+        for pid in listenerPIDs.union(cpuLeaders).union(memoryLeaders) {
+            guard let start = byPID[pid]?.startedAt, start.timeIntervalSince1970 > 0 else { continue }
+            var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            guard pp_working_directory(pid, UInt64(start.timeIntervalSince1970), &buffer, buffer.count) == 0,
+                  let cwd = String(validatingUTF8: buffer) else { continue }
+            let location = locations[cwd] ?? ProcessLocation.lookup(workingDirectory: cwd)
+            locations[cwd] = location
+            byPID[pid]?.location = location
+        }
+        return ResourceSnapshot(byCPU: cpuLeaders.compactMap { byPID[$0] }, byMemory: memoryLeaders.compactMap { byPID[$0] },
+                                byPID: byPID, sampledAt: sampledAt)
     }
 
     func targets(from selected: [Listener]) -> [Target] {

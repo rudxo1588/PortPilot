@@ -66,6 +66,26 @@ static int pp_bsd_equal(const struct proc_bsdinfo *a,
         a->pbi_start_tvusec == b->pbi_start_tvusec;
 }
 
+int pp_working_directory(int32_t pid, uint64_t started_seconds, char *path, size_t path_size) {
+    if (pid <= 0 || !path || !path_size) return EINVAL;
+    path[0] = '\0';
+    struct proc_bsdinfo before, after;
+    int result = pp_read_bsd(pid, &before);
+    if (result) return result;
+    if (before.pbi_start_tvsec != started_seconds) return ESTALE;
+
+    struct proc_vnodepathinfo dirs = {0};
+    int size = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &dirs, sizeof(dirs));
+    if (size != (int)sizeof(dirs) || dirs.pvi_cdir.vip_path[0] != '/') return ENOENT;
+    result = pp_read_bsd(pid, &after);
+    if (result) return result;
+    if (!pp_bsd_equal(&before, &after)) return ESTALE;
+    size_t length = strnlen(dirs.pvi_cdir.vip_path, sizeof(dirs.pvi_cdir.vip_path));
+    if (length == sizeof(dirs.pvi_cdir.vip_path) || length >= path_size) return ENAMETOOLONG;
+    memcpy(path, dirs.pvi_cdir.vip_path, length + 1);
+    return 0;
+}
+
 int pp_read_identity(int32_t pid, PPIdentity *out) {
     if (!out || pid <= 0) return EINVAL;
     memset(out, 0, sizeof(*out));

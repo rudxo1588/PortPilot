@@ -19,6 +19,7 @@ typedef struct {
 } PPIdentity;
 
 /* All functions return an errno value, never -1. No function logs argv/env. */
+int pp_working_directory(int32_t pid, uint64_t started_seconds, char *path, size_t path_size);
 int pp_read_identity(int32_t pid, PPIdentity *identity);
 int pp_signal_identity(const PPIdentity *expected, int signal_number);
 int pp_java_app_identifier(int32_t pid, char *output, size_t output_size);
