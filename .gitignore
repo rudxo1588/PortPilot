@@ -1,0 +1,17 @@
+.DS_Store
+/Build/
+/Dist/
+.build/
+*.orig
+/Resources/PortPilot.iconset/
+/Resources/PortPilot.icns
+/Resources/PortPilot-icon-*.png
+/Tests/CopyReviewBaseline/
+/Tests/*VALIDATION.md
+/Tests/*_report.txt
+/Tests/*.json
+/Tests/tested_sources.sha256
+/Tests/test_listener
+/Tests/Research/*-probe
+/Tests/Research/*_report.json
+__pycache__/
