@@ -97,6 +97,27 @@ private final class ProcessRankingPanel: NSBox {
     }
 }
 
+private enum PortSortColumn: String {
+    case cpu, memory, uptime, port
+
+    static let metrics: [Self] = [.cpu, .memory, .uptime]
+
+    var descriptor: NSSortDescriptor {
+        NSSortDescriptor(key: rawValue, ascending: self == .port)
+    }
+
+    func value(for listener: Listener, usage: ProcessUsage?, sampledAt: Date?) -> Double? {
+        switch self {
+        case .cpu: return usage?.cpuPercent
+        case .memory: return usage.map { Double($0.residentBytes) }
+        case .uptime:
+            guard let start = usage?.startedAt, let sampledAt else { return nil }
+            return max(0, sampledAt.timeIntervalSince(start))
+        case .port: return Double(listener.port)
+        }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     private let service = PortService()
     private let worker = DispatchQueue(label: "local.portpilot.worker", qos: .userInitiated)
@@ -247,8 +268,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             column.width = width
             column.minWidth = id == "check" ? width : 55
             column.resizingMask = id == "check" ? [] : [.userResizingMask]
+            column.sortDescriptorPrototype = PortSortColumn(rawValue: id)?.descriptor
             table.addTableColumn(column)
         }
+        table.sortDescriptors = PortSortColumn.metrics.map(\.descriptor)
         scroll.documentView = table
         copyPortsButton.target = self
         copyPortsButton.action = #selector(copySelectedPorts)
@@ -319,6 +342,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         resultHeight.isActive = true
         scroll.setContentHuggingPriority(.defaultLow, for: .vertical)
         updateButtons()
+    }
+
+    func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        updatePortTable(clearSelection: false)
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { visible.count }
@@ -418,6 +445,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     func controlTextDidChange(_ obj: Notification) { updatePortTable(clearSelection: true) }
     @objc private func filterChanged() { updatePortTable(clearSelection: true) }
 
+    private func sortPorts(_ ports: [Listener]) -> [Listener] {
+        let order = table.sortDescriptors.compactMap { descriptor -> (column: PortSortColumn, ascending: Bool)? in
+            guard let key = descriptor.key, let column = PortSortColumn(rawValue: key) else { return nil }
+            return (column, descriptor.ascending)
+        }
+        guard !order.isEmpty else { return ports }
+
+        let keyed = ports.map { port in
+            let usage = portSnapshot.flatMap { resourceSnapshot?.usage(for: port, in: $0) }
+            let values = order.map { $0.column.value(for: port, usage: usage, sampledAt: resourceSnapshot?.sampledAt) }
+            return (port: port, values: values)
+        }
+        // Stable ties retain the listener snapshot's port/PID/address order.
+        return keyed.sorted { lhs, rhs in
+            for (index, sort) in order.enumerated() {
+                let left = lhs.values[index]
+                let right = rhs.values[index]
+                if left == right { continue }
+                guard let left else { return false }
+                guard let right else { return true }
+                return sort.ascending ? left < right : left > right
+            }
+            return false
+        }.map(\.port)
+    }
+
     private func updatePortTable(clearSelection: Bool, refreshingMetrics: Bool = false) {
         if clearSelection { checked.removeAll() }
         let query = search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -426,7 +479,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let haystack = "\(row.port) \(row.pid) \(row.processName) \(row.owner) \(row.address) \(row.javaApp ?? "")".lowercased()
             return matchFilter && (query.isEmpty || haystack.contains(query))
         }
-        visible = filtered
+        let sorted = sortPorts(filtered)
+        if refreshingMetrics && visible == sorted {
+            let identifiers = PortSortColumn.metrics.map(\.rawValue)
+            let columns = IndexSet(identifiers.map {
+                table.column(withIdentifier: NSUserInterfaceItemIdentifier($0))
+            }.filter { $0 >= 0 })
+            table.reloadData(forRowIndexes: IndexSet(visible.indices), columnIndexes: columns)
+            return
+        }
+        visible = sorted
         table.reloadData()
         updateButtons()
     }
@@ -469,7 +531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     self.resourceSnapshot = nil
                     self.showRankings(cpu: [], memory: [], emptyMessage: "조회 실패")
                 }
-                self.table.reloadData()
+                self.updatePortTable(clearSelection: false, refreshingMetrics: true)
             }
         }
     }
