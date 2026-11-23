@@ -1,10 +1,97 @@
 import AppKit
 import Foundation
 
+private final class ProcessRankingPanel: NSBox {
+    private var rows: [(rank: NSTextField, name: NSTextField, pid: NSTextField, value: NSTextField)] = []
+
+    init(title: String, symbol: String, tint: NSColor) {
+        super.init(frame: .zero)
+        boxType = .custom
+        titlePosition = .noTitle
+        borderWidth = 1
+        borderColor = .separatorColor
+        cornerRadius = 12
+        fillColor = .controlBackgroundColor
+        contentViewMargins = .zero
+
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        icon.contentTintColor = tint
+        let heading = NSTextField(labelWithString: title)
+        heading.font = .systemFont(ofSize: 13, weight: .semibold)
+        let header = NSStackView(views: [icon, heading])
+        header.spacing = 7
+
+        let stack = NSStackView(views: [header])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.setCustomSpacing(8, after: header)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let body = NSView()
+        contentView = body
+        body.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: body.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: body.trailingAnchor, constant: -14),
+            stack.centerYAnchor.constraint(equalTo: body.centerYAnchor)
+        ])
+
+        for index in 0..<3 {
+            let rank = NSTextField(labelWithString: "")
+            rank.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+            rank.textColor = .secondaryLabelColor
+            let name = NSTextField(labelWithString: index == 0 ? "측정 중…" : "")
+            name.lineBreakMode = .byTruncatingMiddle
+            name.font = .systemFont(ofSize: index == 0 ? 16 : 12, weight: index == 0 ? .semibold : .regular)
+            name.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let pid = NSTextField(labelWithString: "")
+            pid.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            pid.textColor = .secondaryLabelColor
+            let value = NSTextField(labelWithString: "")
+            value.font = .monospacedDigitSystemFont(ofSize: index == 0 ? 19 : 12, weight: index == 0 ? .semibold : .medium)
+            value.textColor = index == 0 ? tint : .labelColor
+            value.alignment = .right
+            let line = NSStackView(views: [rank, name, pid, value])
+            line.alignment = .firstBaseline
+            line.spacing = 6
+            stack.addArrangedSubview(line)
+            NSLayoutConstraint.activate([
+                line.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                rank.widthAnchor.constraint(equalToConstant: 14),
+                value.widthAnchor.constraint(greaterThanOrEqualToConstant: 78)
+            ])
+            rows.append((rank, name, pid, value))
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+
+    func display(_ processes: [ProcessUsage], emptyMessage: String, format: (ProcessUsage) -> String) {
+        for (index, row) in rows.enumerated() {
+            let process = processes.indices.contains(index) ? processes[index] : nil
+            row.rank.stringValue = process == nil ? "" : "\(index + 1)"
+            row.name.stringValue = process.map { $0.name } ?? (index == 0 ? emptyMessage : "")
+            row.name.toolTip = process?.name
+            row.pid.stringValue = process.map { "PID \($0.pid)" } ?? ""
+            row.value.stringValue = process.map(format) ?? ""
+        }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     private let service = PortService()
     private let worker = DispatchQueue(label: "local.portpilot.worker", qos: .userInitiated)
     private var window: NSWindow!
+    private let resourceWorker = DispatchQueue(label: "local.portpilot.resources", qos: .utility)
+    private var samplingResources = false
+    private var resourceTimer: Timer?
+    private let resourceTime = NSTextField(labelWithString: "측정 중…")
+    private let cpuPanel = ProcessRankingPanel(title: "CPU", symbol: "cpu", tint: .systemIndigo)
+    private let memoryPanel = ProcessRankingPanel(title: "메모리", symbol: "memorychip", tint: .systemTeal)
+    private let resultTitle = NSTextField(labelWithString: "종료 결과")
+    private let resultScroll = NSScrollView()
     private let table = NSTableView()
     private let search = NSSearchField()
     private let filter = NSSegmentedControl(labels: ["전체", "Java", "개발 프로세스"], trackingMode: .selectOne, target: nil, action: nil)
@@ -15,7 +102,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let selectionLabel = NSTextField(labelWithString: "선택 없음")
     private let statusLabel = NSTextField(wrappingLabelWithString: "포트 조회 중…")
     private let resultView = NSTextView()
-    private var allListeners: [Listener] = []
+    private var portSnapshot: Snapshot?
+    private var allListeners: [Listener] { portSnapshot?.listeners ?? [] }
     private var visible: [Listener] = []
     private var checked = Set<String>()
     private var results: [TerminationResult] = []
@@ -32,6 +120,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         refresh()
+        resourceTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            guard let self, self.window.isVisible, !self.window.isMiniaturized, !NSApp.isHidden else { return }
+            self.refreshResources()
+        }
+        resourceTimer?.tolerance = 0.5
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        resourceTimer?.invalidate()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -64,16 +161,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func buildWindow() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1160, height: 740), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1160, height: 760), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "PortPilot · 포트와 프로세스"
         window.minSize = NSSize(width: 1030, height: 650)
         window.center()
         let content = window.contentView!
-        let title = NSTextField(labelWithString: "포트와 프로세스")
-        title.font = .systemFont(ofSize: 22, weight: .semibold)
-        let subtitle = NSTextField(wrappingLabelWithString: "TCP LISTEN · 현재 사용자만 종료 가능 · 강제 종료는 별도 확인")
-        subtitle.textColor = .secondaryLabelColor
-        subtitle.font = .systemFont(ofSize: 12)
+        let appIcon = NSImageView()
+        appIcon.image = NSApp.applicationIconImage
+        appIcon.imageScaling = .scaleProportionallyUpOrDown
+        let title = NSTextField(labelWithString: "시스템 사용량")
+        title.font = .systemFont(ofSize: 23, weight: .bold)
+        resourceTime.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        resourceTime.textColor = .secondaryLabelColor
+        let titleSpacer = NSView()
+        titleSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let header = NSStackView(views: [appIcon, title, titleSpacer, resourceTime])
+        header.spacing = 8
+        let rankings = NSStackView(views: [cpuPanel, memoryPanel])
+        rankings.distribution = .fillEqually
+        rankings.alignment = .height
+        rankings.spacing = 12
         search.placeholderString = "포트, PID, 프로세스명, 소유자, Java 앱 검색"
         search.delegate = self
         search.setAccessibilityLabel("포트 및 프로세스 검색")
@@ -84,10 +191,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         refreshButton.target = self
         refreshButton.action = #selector(refresh)
         refreshButton.bezelStyle = .rounded
-        let hint = NSTextField(wrappingLabelWithString: "Java·개발 필터에 IDE와 빌드 도구 포함")
-        hint.font = .systemFont(ofSize: 11)
-        hint.textColor = .secondaryLabelColor
-        let toolbar = NSStackView(views: [search, filter, refreshButton])
+        refreshButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+        refreshButton.imagePosition = .imageLeading
+        let portsTitle = NSTextField(labelWithString: "수신 포트")
+        portsTitle.font = .systemFont(ofSize: 16, weight: .semibold)
+        let toolbar = NSStackView(views: [portsTitle, search, filter, refreshButton])
         toolbar.orientation = .horizontal
         toolbar.spacing = 12
         search.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -108,7 +216,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         table.target = self
         table.action = #selector(toggleClickedRow(_:))
         table.setAccessibilityLabel("TCP LISTEN 포트 목록")
-        let columns: [(String, String, CGFloat)] = [("check", "선택", 45), ("port", "포트", 65), ("process", "프로세스", 140), ("pid", "PID", 70), ("owner", "소유자", 95), ("java", "Java 앱 / 용도", 235), ("address", "주소", 135), ("safety", "종료 가능 여부", 205)]
+        let columns: [(String, String, CGFloat)] = [
+            ("check", "선택", 43), ("port", "포트", 55), ("process", "프로세스", 120), ("pid", "PID", 60),
+            ("owner", "소유자", 80), ("java", "Java 앱 / 용도", 150), ("address", "주소", 110),
+            ("safety", "종료 가능 여부", 160)
+        ]
         for (id, label, width) in columns {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
             column.title = label
@@ -138,9 +250,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let actionBar = NSStackView(views: [selectionLabel, spacer, copyPortsButton, forceButton, stopButton])
         actionBar.orientation = .horizontal
         actionBar.spacing = 12
-        let resultTitle = NSTextField(labelWithString: "종료 결과")
+        resultTitle.isHidden = true
         resultTitle.font = .systemFont(ofSize: 13, weight: .semibold)
-        let resultScroll = NSScrollView()
+        resultScroll.isHidden = true
         resultScroll.hasVerticalScroller = true
         resultScroll.borderType = .bezelBorder
         resultView.isEditable = false
@@ -157,10 +269,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         resultScroll.documentView = resultView
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
-        let stack = NSStackView(views: [title, subtitle, toolbar, hint, scroll, actionBar, resultTitle, resultScroll, statusLabel])
+        let stack = NSStackView(views: [header, rankings, toolbar, scroll, actionBar, resultTitle, resultScroll, statusLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 12
+        stack.spacing = 10
+        stack.setCustomSpacing(18, after: rankings)
         stack.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -168,16 +281,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -22),
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+            appIcon.widthAnchor.constraint(equalToConstant: 32),
+            appIcon.heightAnchor.constraint(equalTo: appIcon.widthAnchor),
+            header.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            rankings.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            rankings.heightAnchor.constraint(equalToConstant: 155),
             toolbar.widthAnchor.constraint(equalTo: stack.widthAnchor),
             search.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
             scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 210),
             actionBar.widthAnchor.constraint(equalTo: stack.widthAnchor),
             resultScroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            resultScroll.heightAnchor.constraint(equalToConstant: 142),
-            statusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            hint.widthAnchor.constraint(equalTo: stack.widthAnchor)
+            statusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
+        let resultHeight = resultScroll.heightAnchor.constraint(equalToConstant: 84)
+        resultHeight.priority = .defaultHigh
+        resultHeight.isActive = true
         scroll.setContentHuggingPriority(.defaultLow, for: .vertical)
         updateButtons()
     }
@@ -193,7 +312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             button.state = checked.contains(listener.id) ? .on : .off
             button.isEnabled = !busy && listener.blockedReason == nil && listener.identity != nil
             button.setAccessibilityLabel("\(listener.processName) PID \(listener.pid) 포트 \(listener.port) 선택")
-            button.toolTip = listener.blockedReason ?? "프로세스 종료 시 이 PID의 모든 포트가 닫힙니다."
+            button.toolTip = listener.blockedReason
             button.translatesAutoresizingMaskIntoConstraints = false
             cell.addSubview(button)
             NSLayoutConstraint.activate([button.centerXAnchor.constraint(equalTo: cell.centerXAnchor), button.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
@@ -252,17 +371,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         updateButtons()
     }
 
-    func controlTextDidChange(_ obj: Notification) { applyFilter(clearSelection: true) }
-    @objc private func filterChanged() { applyFilter(clearSelection: true) }
+    func controlTextDidChange(_ obj: Notification) { updatePortTable(clearSelection: true) }
+    @objc private func filterChanged() { updatePortTable(clearSelection: true) }
 
-    private func applyFilter(clearSelection: Bool) {
+    private func updatePortTable(clearSelection: Bool, refreshingMetrics: Bool = false) {
         if clearSelection { checked.removeAll() }
         let query = search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        visible = allListeners.filter { row in
+        let filtered = allListeners.filter { row in
             let matchFilter = filter.selectedSegment == 0 || (filter.selectedSegment == 1 ? row.isJava : row.isDevelopment)
             let haystack = "\(row.port) \(row.pid) \(row.processName) \(row.owner) \(row.address) \(row.javaApp ?? "")".lowercased()
             return matchFilter && (query.isEmpty || haystack.contains(query))
         }
+        visible = filtered
         table.reloadData()
         updateButtons()
     }
@@ -287,8 +407,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         table.reloadData()
     }
 
+    private func refreshResources() {
+        guard !samplingResources else { return }
+        samplingResources = true
+        resourceWorker.async {
+            let outcome = Result { try PortService.resourceSnapshot() }
+            DispatchQueue.main.async {
+                self.samplingResources = false
+                self.resourceTime.stringValue = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+                switch outcome {
+                case .success(let snapshot):
+                    self.showRankings(cpu: snapshot.byCPU, memory: snapshot.byMemory, emptyMessage: "표시할 프로세스 없음")
+                case .failure:
+                    self.showRankings(cpu: [], memory: [], emptyMessage: "조회 실패")
+                }
+            }
+        }
+    }
+
+    private func showRankings(cpu: [ProcessUsage], memory: [ProcessUsage], emptyMessage: String) {
+        cpuPanel.display(cpu, emptyMessage: emptyMessage, format: \.cpuText)
+        memoryPanel.display(memory, emptyMessage: emptyMessage, format: \.memoryText)
+    }
+
     @objc private func refresh() {
         guard !busy else { return }
+        refreshResources()
         checked.removeAll()
         setBusy(true, status: "포트·프로세스 조회 중…")
         worker.async {
@@ -296,14 +440,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             DispatchQueue.main.async {
                 switch outcome {
                 case .success(let snapshot):
-                    self.allListeners = snapshot.listeners
-                    self.applyFilter(clearSelection: true)
+                    self.portSnapshot = snapshot
+                    self.updatePortTable(clearSelection: true)
                     let formatter = DateFormatter()
                     formatter.dateFormat = "HH:mm:ss"
                     self.statusLabel.stringValue = "\(formatter.string(from: Date())) 새로고침 · \(snapshot.listeners.count)개 TCP LISTEN 항목" + (snapshot.warning.map { " · \($0)" } ?? "")
                 case .failure(let error):
-                    self.allListeners = []
-                    self.applyFilter(clearSelection: true)
+                    self.portSnapshot = nil
+                    self.updatePortTable(clearSelection: true)
                     self.statusLabel.stringValue = "목록 확인 실패: \(error.localizedDescription)"
                 }
                 self.setBusy(false)
@@ -380,12 +524,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 } else { self.results = batch }
                 self.renderResults()
                 if let snapshot {
-                    self.allListeners = snapshot.listeners
-                    self.applyFilter(clearSelection: true)
+                    self.portSnapshot = snapshot
+                    self.updatePortTable(clearSelection: true)
                     self.statusLabel.stringValue = "처리 완료 · TCP LISTEN 목록 재확인" + (snapshot.warning.map { " · \($0)" } ?? "")
                 } else {
-                    self.allListeners = []
-                    self.applyFilter(clearSelection: true)
+                    self.portSnapshot = nil
+                    self.updatePortTable(clearSelection: true)
                     self.statusLabel.stringValue = "처리 후 목록 조회 실패 · 새로고침 필요"
                 }
                 self.setBusy(false)
@@ -394,6 +538,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func renderResults() {
+        resultTitle.isHidden = results.isEmpty
+        resultScroll.isHidden = results.isEmpty
         resultView.string = results.map { result in
             let ports = Set(result.target.listeners.map(\.port)).sorted().map(String.init).joined(separator: ", ")
             let release = result.portsReleased.map { $0 ? "포트 해제 확인" : "포트 점유 남음 / 다른 프로세스가 점유" } ?? "포트 해제 확인 불가"
@@ -405,7 +551,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc private func showAbout() {
         let alert = NSAlert()
         alert.messageText = "PortPilot 1.0"
-        alert.informativeText = "TCP LISTEN 포트 조회와 프로세스 종료\n전체 명령줄·환경변수 표시 및 저장 없음"
         alert.runModal()
     }
 }

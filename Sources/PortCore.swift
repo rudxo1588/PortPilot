@@ -40,8 +40,39 @@ struct Listener: Hashable {
 }
 
 struct Snapshot {
+    let scanBeganAt: Date
+    let scanEndedAt: Date
     var listeners: [Listener]
     var warning: String?
+}
+
+struct ProcessUsage {
+    let pid: Int32
+    let name: String
+    let cpuPercent: Double
+    let residentBytes: Int64
+    let startedAt: Date?
+
+    var cpuText: String { String(format: "%.1f%%", cpuPercent) }
+    var memoryText: String { ByteCountFormatter.string(fromByteCount: residentBytes, countStyle: .memory) }
+}
+
+struct ResourceSnapshot {
+    let byCPU: [ProcessUsage]
+    let byMemory: [ProcessUsage]
+    let byPID: [Int32: ProcessUsage]
+    let sampledAt: Date
+
+    func usage(for listener: Listener, in ports: Snapshot) -> ProcessUsage? {
+        guard let process = byPID[listener.pid], let start = process.startedAt else { return nil }
+        if let identity = listener.identity {
+            return start.timeIntervalSince1970 == Double(identity.startedSeconds) ? process : nil
+        }
+        // With no verified identity, the sampled process must span the whole port scan.
+        // ps reports start times to the second.
+        guard start.addingTimeInterval(1) <= ports.scanBeganAt, sampledAt >= ports.scanEndedAt else { return nil }
+        return process
+    }
 }
 
 struct Target {
@@ -84,6 +115,63 @@ final class PortService {
         displayedListeners = snapshot.listeners
         snapshotLock.unlock()
         return snapshot
+    }
+
+    static func resourceSnapshot() throws -> ResourceSnapshot {
+        // A private temporary file lets ps finish even if its output exceeds a pipe buffer.
+        guard let output = tmpfile() else { throw PortError.message("프로세스 사용량을 수집할 수 없습니다.") }
+        defer { fclose(output) }
+        let handle = FileHandle(fileDescriptor: fileno(output), closeOnDealloc: false)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-Aww", "-o", "pid=", "-o", "pcpu=", "-o", "rss=", "-o", "lstart=", "-o", "comm="]
+        process.environment = ["LC_ALL": "C", "TZ": "UTC0"]
+        process.currentDirectoryURL = URL(fileURLWithPath: "/")
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = handle
+        process.standardError = FileHandle.nullDevice
+
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
+        let sampledAt = Date()
+        try process.run()
+        guard done.wait(timeout: .now() + 5) == .success else {
+            if process.isRunning { process.terminate() }
+            throw PortError.message("프로세스 사용량 조회 시간이 초과되었습니다.")
+        }
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw PortError.message("프로세스 사용량을 읽을 수 없습니다.")
+        }
+
+        let byteCount = try handle.seekToEnd()
+        guard byteCount <= 16 * 1024 * 1024 else { throw PortError.message("프로세스 목록이 너무 큽니다.") }
+        try handle.seek(toOffset: 0)
+        let data = try handle.readToEnd() ?? Data()
+        let startFormat = DateFormatter()
+        startFormat.locale = Locale(identifier: "en_US_POSIX")
+        startFormat.timeZone = TimeZone(secondsFromGMT: 0)
+        startFormat.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        let rows = String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).compactMap { line -> ProcessUsage? in
+            let fields = line.split(maxSplits: 8, whereSeparator: \.isWhitespace)
+            guard fields.count == 9,
+                  let pid = Int32(fields[0]), pid >= 0, pid != process.processIdentifier,
+                  let cpu = Double(fields[1]), cpu.isFinite, cpu >= 0,
+                  let rss = Int64(fields[2]), rss >= 0, rss <= Int64.max / 1024 else { return nil }
+            let startedAt = startFormat.date(from: fields[3...7].joined(separator: " "))
+            let executable = fields[8].trimmingCharacters(in: .whitespaces)
+            let name = (executable as NSString).lastPathComponent
+            guard !name.isEmpty else { return nil }
+            return ProcessUsage(pid: pid, name: name, cpuPercent: cpu, residentBytes: rss * 1024, startedAt: startedAt)
+        }
+        guard !rows.isEmpty else { throw PortError.message("조회 가능한 프로세스 사용량이 없습니다.") }
+        let byCPU = rows.sorted {
+            $0.cpuPercent == $1.cpuPercent ? $0.pid < $1.pid : $0.cpuPercent > $1.cpuPercent
+        }
+        let byMemory = rows.sorted {
+            $0.residentBytes == $1.residentBytes ? $0.pid < $1.pid : $0.residentBytes > $1.residentBytes
+        }
+        return ResourceSnapshot(byCPU: Array(byCPU.prefix(3)), byMemory: Array(byMemory.prefix(3)),
+                                byPID: Dictionary(rows.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first }), sampledAt: sampledAt)
     }
 
     func targets(from selected: [Listener]) -> [Target] {
@@ -228,6 +316,7 @@ final class PortService {
     }
 
     private func readSnapshot() throws -> Snapshot {
+        let scanBeganAt = Date()
         let (first, firstWarning) = try runLsof()
         let firstRows = try parseRows(first)
         var before: [Int32: ProcessIdentity] = [:]
@@ -262,7 +351,7 @@ final class PortService {
                             address: row.address, javaApp: identity == nil ? nil : java[row.pid],
                             blockedReason: blocked, socketKey: row.socketKey)
         }.sorted { ($0.port, $0.pid, $0.address, $0.socketKey) < ($1.port, $1.pid, $1.address, $1.socketKey) }
-        return Snapshot(listeners: listeners, warning: warning)
+        return Snapshot(scanBeganAt: scanBeganAt, scanEndedAt: Date(), listeners: listeners, warning: warning)
     }
 
     static func displaySafe(_ string: String) -> String {
