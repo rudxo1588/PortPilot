@@ -121,6 +121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let statusLabel = NSTextField(wrappingLabelWithString: "포트 조회 중…")
     private let resultView = NSTextView()
     private var portSnapshot: Snapshot?
+    private var resourceSnapshot: ResourceSnapshot?
     private var allListeners: [Listener] { portSnapshot?.listeners ?? [] }
     private var visible: [Listener] = []
     private var checked = Set<String>()
@@ -236,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         table.setAccessibilityLabel("TCP LISTEN 포트 목록")
         let columns: [(String, String, CGFloat)] = [
             ("check", "선택", 43), ("port", "포트", 55), ("process", "프로세스", 120), ("pid", "PID", 60),
+            ("cpu", "CPU", 66), ("memory", "메모리", 82), ("uptime", "실행 시간", 100),
             ("owner", "소유자", 80), ("java", "Java 앱 / 용도", 150), ("address", "주소", 110),
             ("safety", "종료 가능 여부", 160)
         ]
@@ -344,6 +346,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         case "port": label.stringValue = String(listener.port); label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
         case "process": label.stringValue = listener.processName
         case "pid": label.stringValue = String(listener.pid); label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        case "uptime", "memory", "cpu":
+            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            label.stringValue = "—"
+            if let ports = portSnapshot, let resources = resourceSnapshot,
+               let process = resources.usage(for: listener, in: ports) {
+                switch column.identifier.rawValue {
+                case "uptime":
+                    if let start = process.startedAt {
+                        label.stringValue = elapsedText(resources.sampledAt.timeIntervalSince(start))
+                    }
+                case "memory": label.stringValue = process.memoryText
+                default: label.stringValue = process.cpuText
+                }
+            }
         case "owner": label.stringValue = listener.owner
         case "java": label.stringValue = listener.javaApp ?? (listener.isJava ? "Java · 식별자 확인 불가" : "—")
         case "address": label.stringValue = listener.address
@@ -357,6 +373,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         cell.textField = label
         NSLayoutConstraint.activate([label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 3), label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -3), label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
         return cell
+    }
+
+    private func elapsedText(_ interval: TimeInterval) -> String {
+        let seconds = max(0, Int(interval))
+        let minutes = seconds / 60
+        let hours = minutes / 60
+        if hours >= 24 { return "\(hours / 24)일 \(hours % 24)시간" }
+        if hours > 0 { return "\(hours)시간 \(minutes % 60)분" }
+        if minutes > 0 { return "\(minutes)분 \(seconds % 60)초" }
+        return "\(seconds)초"
     }
 
     @objc private func toggleClickedRow(_ sender: NSTableView) {
@@ -437,10 +463,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 self.resourceTime.stringValue = DateFormatter.localizedString(from: capacity.sampledAt, dateStyle: .none, timeStyle: .medium)
                 switch outcome {
                 case .success(let snapshot):
+                    self.resourceSnapshot = snapshot
                     self.showRankings(cpu: snapshot.byCPU, memory: snapshot.byMemory, emptyMessage: "표시할 프로세스 없음")
                 case .failure:
+                    self.resourceSnapshot = nil
                     self.showRankings(cpu: [], memory: [], emptyMessage: "조회 실패")
                 }
+                self.table.reloadData()
             }
         }
     }
