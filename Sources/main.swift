@@ -2,6 +2,8 @@ import AppKit
 import Foundation
 
 private final class ProcessRankingPanel: NSBox {
+    private let capacityLabel = NSTextField(labelWithString: "—")
+    private let capacityBar = NSProgressIndicator()
     private var rows: [(rank: NSTextField, name: NSTextField, pid: NSTextField, value: NSTextField)] = []
 
     init(title: String, symbol: String, tint: NSColor) {
@@ -22,11 +24,19 @@ private final class ProcessRankingPanel: NSBox {
         let header = NSStackView(views: [icon, heading])
         header.spacing = 7
 
-        let stack = NSStackView(views: [header])
+        capacityLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .medium)
+        capacityBar.style = .bar
+        capacityBar.controlSize = .small
+        capacityBar.isIndeterminate = false
+        capacityBar.minValue = 0
+        capacityBar.maxValue = 1
+        capacityBar.isHidden = true
+        capacityBar.setAccessibilityElement(false)
+        let stack = NSStackView(views: [header, capacityLabel, capacityBar])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 4
-        stack.setCustomSpacing(8, after: header)
+        stack.setCustomSpacing(8, after: capacityBar)
         stack.translatesAutoresizingMaskIntoConstraints = false
         let body = NSView()
         contentView = body
@@ -34,7 +44,8 @@ private final class ProcessRankingPanel: NSBox {
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: body.leadingAnchor, constant: 14),
             stack.trailingAnchor.constraint(equalTo: body.trailingAnchor, constant: -14),
-            stack.centerYAnchor.constraint(equalTo: body.centerYAnchor)
+            stack.centerYAnchor.constraint(equalTo: body.centerYAnchor),
+            capacityBar.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
 
         for index in 0..<3 {
@@ -68,6 +79,12 @@ private final class ProcessRankingPanel: NSBox {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
 
+    func showCapacity(_ text: String, fraction: Double?) {
+        capacityLabel.stringValue = text
+        capacityBar.isHidden = fraction == nil
+        capacityBar.doubleValue = fraction ?? 0
+    }
+
     func display(_ processes: [ProcessUsage], emptyMessage: String, format: (ProcessUsage) -> String) {
         for (index, row) in rows.enumerated() {
             let process = processes.indices.contains(index) ? processes[index] : nil
@@ -85,6 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let worker = DispatchQueue(label: "local.portpilot.worker", qos: .userInitiated)
     private var window: NSWindow!
     private let resourceWorker = DispatchQueue(label: "local.portpilot.resources", qos: .utility)
+    private var capacitySampler = SystemCapacitySampler()
     private var samplingResources = false
     private var resourceTimer: Timer?
     private let resourceTime = NSTextField(labelWithString: "측정 중…")
@@ -411,10 +429,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard !samplingResources else { return }
         samplingResources = true
         resourceWorker.async {
+            let capacity = self.capacitySampler.sample()
             let outcome = Result { try PortService.resourceSnapshot() }
             DispatchQueue.main.async {
                 self.samplingResources = false
-                self.resourceTime.stringValue = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+                self.showCapacity(capacity)
+                self.resourceTime.stringValue = DateFormatter.localizedString(from: capacity.sampledAt, dateStyle: .none, timeStyle: .medium)
                 switch outcome {
                 case .success(let snapshot):
                     self.showRankings(cpu: snapshot.byCPU, memory: snapshot.byMemory, emptyMessage: "표시할 프로세스 없음")
@@ -422,6 +442,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     self.showRankings(cpu: [], memory: [], emptyMessage: "조회 실패")
                 }
             }
+        }
+    }
+
+    private func showCapacity(_ capacity: SystemCapacity) {
+        let cores = capacity.coreCount
+        var cpuText = "전체 \(cores)코어 · 사용 — · 여유 —"
+        if let fraction = capacity.busyFraction {
+            let used = (fraction * Double(cores) * 10).rounded() / 10
+            cpuText = String(format: "전체 %d코어 · 사용 %.1f코어 · 여유 %.1f코어", cores, used, Double(cores) - used)
+        }
+        cpuPanel.showCapacity(cpuText, fraction: capacity.busyFraction)
+
+        let total = capacity.totalMemory
+        func size(_ bytes: Int64) -> String {
+            ByteCountFormatter.string(fromByteCount: bytes, countStyle: .memory)
+        }
+        if let used = capacity.usedMemory {
+            let text = "전체 \(size(total)) · 사용 \(size(used)) · 여유(추정) \(size(total - used))"
+            memoryPanel.showCapacity(text, fraction: Double(used) / Double(total))
+        } else {
+            memoryPanel.showCapacity("전체 \(size(total)) · 사용 — · 여유 —", fraction: nil)
         }
     }
 

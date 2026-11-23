@@ -75,6 +75,73 @@ struct ResourceSnapshot {
     }
 }
 
+struct SystemCapacity {
+    let coreCount: Int
+    let busyFraction: Double?
+    let totalMemory: Int64
+    let usedMemory: Int64?
+    let sampledAt: Date
+}
+
+// Accessed exclusively on the resource sampling queue.
+struct SystemCapacitySampler {
+    private var previousCPU: (ticks: host_cpu_load_info_data_t, uptime: TimeInterval, cores: Int)?
+
+    mutating func sample() -> SystemCapacity {
+        let host = mach_host_self()
+        defer { mach_port_deallocate(mach_task_self_, host) }
+        let system = ProcessInfo.processInfo
+        let cores = system.activeProcessorCount
+        let total = Int64(system.physicalMemory)
+        let busy = sampleCPU(host: host, cores: cores, uptime: system.systemUptime)
+        return SystemCapacity(coreCount: cores, busyFraction: busy, totalMemory: total,
+                              usedMemory: usedMemory(host: host, total: total), sampledAt: Date())
+    }
+
+    private mutating func sampleCPU(host: host_t, cores: Int, uptime: TimeInterval) -> Double? {
+        var info = host_cpu_load_info_data_t()
+        let words = MemoryLayout.size(ofValue: info) / MemoryLayout<integer_t>.stride
+        var count = mach_msg_type_number_t(words)
+        let status = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: words) {
+                host_statistics(host, HOST_CPU_LOAD_INFO, $0, &count)
+            }
+        }
+        guard status == KERN_SUCCESS, count == words else {
+            previousCPU = nil
+            return nil
+        }
+        let previous = previousCPU
+        previousCPU = (info, uptime, cores)
+        guard let previous, cores == previous.cores, uptime - previous.uptime <= 15 else { return nil }
+
+        // Mach counters wrap individually. CPU_STATE order is user, system, idle, nice.
+        let now = info.cpu_ticks
+        let old = previous.ticks.cpu_ticks
+        let busy = UInt64(now.0 &- old.0) + UInt64(now.1 &- old.1) + UInt64(now.3 &- old.3)
+        let total = busy + UInt64(now.2 &- old.2)
+        return total > 0 ? Double(busy) / Double(total) : nil
+    }
+
+    private func usedMemory(host: host_t, total: Int64) -> Int64? {
+        var info = vm_statistics64_data_t()
+        let words = MemoryLayout.size(ofValue: info) / MemoryLayout<integer_t>.stride
+        var count = mach_msg_type_number_t(words)
+        let status = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: words) {
+                host_statistics64(host, HOST_VM_INFO64, $0, &count)
+            }
+        }
+        var pageSize: vm_size_t = 0
+        guard status == KERN_SUCCESS, count == words,
+              host_page_size(host, &pageSize) == KERN_SUCCESS, pageSize > 0, total > 0 else { return nil }
+        // Anonymous pages still needed by apps, wired RAM, and the compressor's physical pages.
+        let appPages = max(0, Int64(info.internal_page_count) - Int64(info.purgeable_count))
+        let usedPages = appPages + Int64(info.wire_count) + Int64(info.compressor_page_count)
+        return min(total, usedPages * Int64(pageSize))
+    }
+}
+
 struct Target {
     var identity: ProcessIdentity
     var listeners: [Listener]
