@@ -100,6 +100,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         table.selectionHighlightStyle = .none
         table.dataSource = self
         table.delegate = self
+        table.target = self
+        table.action = #selector(toggleClickedRow(_:))
         table.setAccessibilityLabel("TCP LISTEN 포트 목록")
         let columns: [(String, String, CGFloat)] = [("check", "선택", 45), ("port", "포트", 65), ("process", "프로세스", 140), ("pid", "PID", 70), ("owner", "소유자", 95), ("java", "Java 앱 / 용도", 235), ("address", "주소", 135), ("safety", "종료 가능 여부", 205)]
         for (id, label, width) in columns {
@@ -178,7 +180,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if column.identifier.rawValue == "check" {
             let cell = NSView()
             let button = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggleCheck(_:)))
-            button.tag = row
             button.state = checked.contains(listener.id) ? .on : .off
             button.isEnabled = !busy && listener.blockedReason == nil && listener.identity != nil
             button.setAccessibilityLabel("\(listener.processName) PID \(listener.pid) 포트 \(listener.port) 선택")
@@ -211,11 +212,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return cell
     }
 
+    @objc private func toggleClickedRow(_ sender: NSTableView) {
+        let checkColumn = sender.column(withIdentifier: NSUserInterfaceItemIdentifier("check"))
+        guard sender.clickedColumn != checkColumn else { return }
+        toggleCheck(at: sender.clickedRow)
+    }
+
     @objc private func toggleCheck(_ sender: NSButton) {
-        guard !busy, sender.tag < visible.count else { return }
-        let listener = visible[sender.tag]
+        toggleCheck(at: table.row(for: sender))
+    }
+
+    private func toggleCheck(at row: Int) {
+        guard !busy, visible.indices.contains(row) else { return }
+        let listener = visible[row]
         guard listener.blockedReason == nil, listener.identity != nil else { return }
-        if sender.state == .on { checked.insert(listener.id) } else { checked.remove(listener.id) }
+
+        let isChecked = !checked.contains(listener.id)
+        if isChecked {
+            checked.insert(listener.id)
+        } else {
+            checked.remove(listener.id)
+        }
+
+        let checkColumn = table.column(withIdentifier: NSUserInterfaceItemIdentifier("check"))
+        if checkColumn >= 0,
+           let button = table.view(atColumn: checkColumn, row: row, makeIfNecessary: false)?.subviews.first as? NSButton {
+            button.state = isChecked ? .on : .off
+        }
         updateButtons()
     }
 
