@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let search = NSSearchField()
     private let filter = NSSegmentedControl(labels: ["전체", "Java", "개발 프로세스"], trackingMode: .selectOne, target: nil, action: nil)
     private let refreshButton = NSButton(title: "새로고침", target: nil, action: nil)
+    private let copyPortsButton = NSButton(title: "선택 포트 복사", target: nil, action: nil)
     private let stopButton = NSButton(title: "선택 종료…", target: nil, action: nil)
     private let forceButton = NSButton(title: "강제 종료…", target: nil, action: nil)
     private let selectionLabel = NSTextField(labelWithString: "선택 없음")
@@ -19,6 +20,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var checked = Set<String>()
     private var results: [TerminationResult] = []
     private var busy = false
+
+    private var checkedListeners: [Listener] {
+        allListeners.filter { checked.contains($0.id) }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -113,6 +118,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             table.addTableColumn(column)
         }
         scroll.documentView = table
+        copyPortsButton.target = self
+        copyPortsButton.action = #selector(copySelectedPorts)
+        copyPortsButton.bezelStyle = .rounded
+        copyPortsButton.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+        copyPortsButton.imagePosition = .imageLeading
         stopButton.target = self
         stopButton.action = #selector(stopSelected)
         stopButton.bezelStyle = .rounded
@@ -125,7 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         forceButton.isEnabled = false
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let actionBar = NSStackView(views: [selectionLabel, spacer, forceButton, stopButton])
+        let actionBar = NSStackView(views: [selectionLabel, spacer, copyPortsButton, forceButton, stopButton])
         actionBar.orientation = .horizontal
         actionBar.spacing = 12
         let resultTitle = NSTextField(labelWithString: "종료 결과")
@@ -258,10 +268,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func updateButtons() {
-        let rows = allListeners.filter { checked.contains($0.id) }
+        let rows = checkedListeners
+        let hasSelection = !busy && !rows.isEmpty
         let processes = Set(rows.map(\.pid)).count
         selectionLabel.stringValue = rows.isEmpty ? "선택 없음 · \(visible.count)개 포트 표시" : "\(rows.count)개 포트 선택 · \(processes)개 프로세스"
-        stopButton.isEnabled = !busy && !rows.isEmpty
+        copyPortsButton.isEnabled = hasSelection
+        stopButton.isEnabled = hasSelection
         forceButton.isEnabled = !busy && results.contains(where: \.needsForce)
         refreshButton.isEnabled = !busy
         search.isEnabled = !busy
@@ -321,9 +333,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
+    @objc private func copySelectedPorts() {
+        guard !busy else { return }
+        let ports = Set(checkedListeners.map(\.port)).sorted()
+        guard !ports.isEmpty else { return }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        if pasteboard.setString(ports.map(String.init).joined(separator: "\n"), forType: .string) {
+            statusLabel.stringValue = "포트 번호 \(ports.count)개 복사됨"
+        } else {
+            statusLabel.stringValue = "포트 번호를 복사하지 못했습니다."
+        }
+    }
+
     @objc private func stopSelected() {
         guard !busy else { return }
-        let selectedPIDs = Set(allListeners.filter { checked.contains($0.id) }.map(\.pid))
+        let selectedPIDs = Set(checkedListeners.map(\.pid))
         let targets = service.targets(from: allListeners.filter { selectedPIDs.contains($0.pid) })
         guard !targets.isEmpty else { return }
         showConfirmation(title: "\(targets.count)개 프로세스를 종료할까요?", detail: description(for: targets) + "\n\n선택한 PID의 모든 포트와 작업이 종료됩니다. SIGTERM 후 최대 4초 대기하며, 강제 종료는 별도 확인이 필요합니다.", destructive: "일반 종료 (SIGTERM)", cancelFirst: false) {
